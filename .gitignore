@@ -1,0 +1,11 @@
+htmldocs/
+nimcache/
+nimblecache/
+*.exe
+*~
+
+# Local build/test binaries
+/cozywavparser
+/test
+tests/t*
+!tests/t*.nim

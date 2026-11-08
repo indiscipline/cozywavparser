@@ -21,15 +21,16 @@ Unknown format tags and unknown extensible subformats are rejected by default. C
 
 ## Installation
 
-Cozy Wav Parser is not yet in the nimble directory. You can `git clone` or download the module directly.
+Requires Nim >= 2.0.0.
 
-Upon acceptance in the nimble directory, you can install it using `atlas` or `nimble`:
+Cozy Wav Parser is in the [Nimble directory](https://nimble.directory/pkg/cozywavparser),
+use `atlas` or `nimble` to install:
 
-```
+```bash
 atlas use cozywavparser
 ```
 
-```
+```bash
 nimble install cozywavparser
 ```
 
@@ -65,9 +66,11 @@ Documentation is included. You can generate it locally with `nim doc cozywavpars
 
 The RIFF chunk-walking regression suite synthesizes WAV files in memory; it does not require any audio fixtures:
 
+```sh
+nimble test
 ```
-nim c -r --path:. tests/test_foreign_chunks.nim
-```
+
+Each test file runs: once in the default configuration and once with `-d:cwpAllowUnknownFormats`.
 
 ## License
 
