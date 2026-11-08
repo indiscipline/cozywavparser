@@ -10,7 +10,11 @@ While the actual PCM format specification is complex, this module focuses on sup
 
 - Supports parsing headers for the most common WAVE files
 - Skips unknown RIFF chunks (e.g. `bext`, `JUNK`, `PAD `, `FLLR`) that precede the `fmt ` chunk
+- Resolves `WAVE_FORMAT_EXTENSIBLE` through its `SubFormat` GUID and exposes the raw `waveFormatTag`/`subFormatTag` values
+- Validates PCM-like `fmt ` fields: byte-aligned bits, `nBlockAlign`, and `nAvgBytesPerSec`
 - Extracts essential audio stream information: sample rate, bit depth, number of channels, byte rate, and float/integer sample format
+
+Unknown format tags and unknown extensible subformats are rejected by default. Compile with `-d:cwpAllowUnknownFormats` to accept them as `WAVE_FORMAT_UNKNOWN` while preserving the raw tag fields.
 
 > [!WARNING]
 > This code is not thoroughly tested and might not work correctly for all valid WAV files. PRs welcome.

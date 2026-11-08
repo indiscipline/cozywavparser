@@ -8,33 +8,57 @@
 ## This module is useful to quickly extract common information about the audio
 ## stream in a WAV file, such as sample rate, bit depth and the number of channels.
 ##
+## `WAVE_FORMAT_EXTENSIBLE` files are resolved through their `SubFormat` GUID;
+## `WavHeader.waveFormat` reports the effective format while `waveFormatTag`
+## and `subFormatTag` expose the raw tag values.
+##
+## Unknown format tags and unknown extensible subformats are rejected by
+## default. Compile with `-d:cwpAllowUnknownFormats` to return
+## `WAVE_FORMAT_UNKNOWN` and preserve the raw tags instead.
+##
 ## .. warning:: This code is not thoroughly tested and might not work correctly
 ##    for all valid WAV files
 
 import std/streams
 from std/enumutils import items
 
+const
+  cwpAllowUnknownFormats* {.booldefine.} = false ##|
+    ## When enabled at build time (`-d:cwpAllowUnknownFormats`), unknown
+    ## `wFormatTag` values and unknown `WAVE_FORMAT_EXTENSIBLE` subformats are
+    ## returned as `WAVE_FORMAT_UNKNOWN` instead of raising `WavParseError`.
+
 type
-  WavHeaderRaw = object
-    waveFormat: uint16
-    numChannels: uint16
-    sampleRate: uint32
-    byteRate: uint32
-    bitsPerSample: uint16
-
-  ChunkHeader = object
-    id: array[4, char]
-    size: uint32
-
   WaveFormatTag* = enum ## Represents a non-exhaustive list of WAVE data formats.
+    WAVE_FORMAT_UNKNOWN = (0x0, "Unknown"),
     WAVE_FORMAT_PCM = (0x1, "PCM"),
     WAVE_FORMAT_IEEE_FLOAT = (0x3, "IEEE float"),
     WAVE_FORMAT_ALAW = (0x6, "8-bit ITU-T G.711 A-law"),
     WAVE_FORMAT_MULAW = (0x7,  "8-bit ITU-T G.711 µ-law"),
     WAVE_FORMAT_EXTENSIBLE = (0xFFFE, "Extensible Wave Format"),
 
+  WavHeaderRaw = object
+    waveFormatTag: uint16
+    effectiveFormat: WaveFormatTag
+    subFormatTag: uint16
+    numChannels: uint16
+    sampleRate: uint32
+    byteRate: uint32
+    bitsPerSample: uint16
+    isFloat: bool
+
+  ChunkHeader = object
+    id: array[4, char]
+    size: uint32
+
   WavHeader* = object ## A parsed and superficially validated WAVE header.
     waveFormat*: WaveFormatTag
+      ## Effective audio format. For `WAVE_FORMAT_EXTENSIBLE`, this is resolved
+      ## from `SubFormat`.
+    waveFormatTag*: uint16
+      ## Raw `wFormatTag` field. For extensible files this is `0xFFFE`.
+    subFormatTag*: uint16
+      ## Raw `SubFormat` GUID tag for extensible files, otherwise 0.
     numChannels*: int
     sampleRate*: int
     byteRate*: int
@@ -46,6 +70,7 @@ type
     weNoWave
     weNoFmt
     weInvalidFmtSize
+    weInvalidFmt
     weUnsupportedFormat
     weTruncatedHeader
     weTruncatedChunk
@@ -53,19 +78,33 @@ type
   WavParseError* = object of ValueError ##|
     ## Raised when a WAVE header is malformed or unsupported.
     ##
-    ## `kind` identifies the failure without inspecting `msg`.
+    ## `kind` identifies the failure without inspecting `msg`. Because this is
+    ## a `ValueError`, callers of `readWavFileHeader` that already catch
+    ## `ValueError` keep working.
     kind*: WavErrorKind
 
-{.push warning[HoleEnumConv]:off.}
 const
   CHUNKID = ['R', 'I', 'F', 'F']
   FORMAT =  ['W', 'A', 'V', 'E']
   SUBCHUNK1ID = ['f', 'm', 't', ' ']
-  SupportedWaveFormatTags = block:
-    var wfSet: set[uint16]
-    for wf in items(WaveFormatTag): wfSet.incl wf.uint16
-    wfSet
-{.pop.}
+
+func toWaveFormatTag(raw: uint16): WaveFormatTag =
+  for fmt in items(WaveFormatTag):
+    if fmt.uint16 == raw:
+      return fmt
+  WAVE_FORMAT_UNKNOWN
+
+func isKnownFormat(fmt: WaveFormatTag): bool =
+  case fmt
+  of WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW,
+     WAVE_FORMAT_MULAW, WAVE_FORMAT_EXTENSIBLE: true
+  of WAVE_FORMAT_UNKNOWN: false
+
+func isPcmLike(fmt: WaveFormatTag): bool =
+  case fmt
+  of WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW,
+     WAVE_FORMAT_MULAW: true
+  else: false
 
 func wavErrorMessage(kind: WavErrorKind; detail = ""): string =
   case kind
@@ -75,6 +114,7 @@ func wavErrorMessage(kind: WavErrorKind; detail = ""): string =
       if detail.len > 0: "No fmt subchunk found (found: " & detail & ")"
       else: "No fmt subchunk found"
     of weInvalidFmtSize: "Invalid fmt subchunk size: " & detail
+    of weInvalidFmt: "Invalid fmt subchunk fields: " & detail
     of weUnsupportedFormat: "Unknown/unsupported wave format: " & detail
     of weTruncatedHeader: "Truncated RIFF chunk header"
     of weTruncatedChunk: "Unexpected end of file inside a RIFF chunk"
@@ -82,6 +122,34 @@ func wavErrorMessage(kind: WavErrorKind; detail = ""): string =
 proc newWavError(kind: WavErrorKind; detail = ""): ref WavParseError =
   result = newException(WavParseError, wavErrorMessage(kind, detail))
   result.kind = kind
+
+proc validateFmtFields(raw: WavHeaderRaw; blockAlign: uint16;
+                       extensible: bool) {.raises: [WavParseError].} =
+  ## Validates cross-field consistency for the PCM-like formats this module
+  ## supports. Unknown formats are left unvalidated because their field
+  ## semantics are format-specific.
+  if not isPcmLike(raw.effectiveFormat):
+    return
+  if raw.numChannels == 0:
+    raise newWavError(weInvalidFmt, "nChannels is 0")
+  if raw.sampleRate == 0:
+    raise newWavError(weInvalidFmt, "nSamplesPerSec is 0")
+  if raw.bitsPerSample == 0:
+    raise newWavError(weInvalidFmt, "wBitsPerSample is 0")
+  if extensible and raw.bitsPerSample mod 8 != 0:
+    raise newWavError(weInvalidFmt, "wBitsPerSample is not a multiple of 8")
+
+  let
+    containerBytes = (uint32(raw.bitsPerSample) + 7) div 8
+    expectedBlockAlign = uint32(raw.numChannels) * containerBytes
+  if uint32(blockAlign) != expectedBlockAlign:
+    raise newWavError(weInvalidFmt,
+      "nBlockAlign=" & $blockAlign & ", expected " & $expectedBlockAlign)
+
+  let expectedByteRate = uint64(raw.sampleRate) * uint64(blockAlign)
+  if uint64(raw.byteRate) != expectedByteRate:
+    raise newWavError(weInvalidFmt,
+      "nAvgBytesPerSec=" & $raw.byteRate & ", expected " & $expectedByteRate)
 
 proc skipBytes(file: Stream; count: int64) {.raises: [IOError, OSError, WavParseError].} =
   ## Consumes `count` bytes from the stream without allocating `count` bytes.
@@ -148,16 +216,52 @@ proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, W
       if chunk.size < 16:
         raise newWavError(weInvalidFmtSize, $chunk.size)
 
-      result.waveFormat = readUint16(file)
-      if result.waveFormat notin SupportedWaveFormatTags:
-        raise newWavError(weUnsupportedFormat, $result.waveFormat)
+      result.waveFormatTag = readUint16(file)
+      result.effectiveFormat = toWaveFormatTag(result.waveFormatTag)
+      result.subFormatTag = 0
 
       result.numChannels = readUint16(file)
       result.sampleRate = readUint32(file)
       result.byteRate = readUint32(file)
-      discard readUint16(file) # block align
+      let blockAlign = readUint16(file)
       result.bitsPerSample = readUint16(file)
-      skipChunkPayload(file, chunk.size - 16) # Extra fmt fields and padding
+
+      if result.waveFormatTag == WAVE_FORMAT_EXTENSIBLE.uint16:
+        if chunk.size < 18:
+          raise newWavError(weInvalidFmtSize, $chunk.size)
+        let cbSize = readUint16(file)
+        if cbSize < 22 or int64(cbSize) > int64(chunk.size) - 18:
+          raise newWavError(weInvalidFmt,
+            "cbSize=" & $cbSize & ", fmt size=" & $chunk.size)
+
+        discard readUint16(file) # wValidBitsPerSample
+        discard readUint32(file) # dwChannelMask
+        var subFormatGuid: array[16, char]
+        file.read(subFormatGuid)
+        result.subFormatTag =
+          uint16(ord(subFormatGuid[0])) or
+          (uint16(ord(subFormatGuid[1])) shl 8)
+
+        let subFormat = toWaveFormatTag(result.subFormatTag)
+        if isPcmLike(subFormat):
+          result.effectiveFormat = subFormat
+        elif cwpAllowUnknownFormats:
+          result.effectiveFormat = WAVE_FORMAT_UNKNOWN
+        else:
+          raise newWavError(weUnsupportedFormat,
+            "extensible subformat " & $result.subFormatTag)
+        result.isFloat = result.effectiveFormat == WAVE_FORMAT_IEEE_FLOAT
+        validateFmtFields(result, blockAlign, extensible = true)
+        skipChunkPayload(file, chunk.size - 40)
+      else:
+        if not isKnownFormat(result.effectiveFormat):
+          if cwpAllowUnknownFormats:
+            result.effectiveFormat = WAVE_FORMAT_UNKNOWN
+          else:
+            raise newWavError(weUnsupportedFormat, $result.waveFormatTag)
+        result.isFloat = result.effectiveFormat == WAVE_FORMAT_IEEE_FLOAT
+        validateFmtFields(result, blockAlign, extensible = false)
+        skipChunkPayload(file, chunk.size - 16)
       return result
 
     if seenCount < MaxReportedChunks:
@@ -179,18 +283,16 @@ proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, W
       detail.add(", ...")
   raise newWavError(weNoFmt, detail)
 
-{.push warning[HoleEnumConv]:off.}
-proc toWaveFormatEnumUnsafe(n: uint16): WaveFormatTag {.inline.} = WaveFormatTag(n)
-{.pop.}
-
 func toWavHeader(rawHeader: WavHeaderRaw): WavHeader {.inline.} =
   WavHeader(
-    waveFormat: toWaveFormatEnumUnsafe(rawHeader.waveFormat),
+    waveFormat: rawHeader.effectiveFormat,
+    waveFormatTag: rawHeader.waveFormatTag,
+    subFormatTag: rawHeader.subFormatTag,
     numChannels: int(rawHeader.numChannels),
     sampleRate: int(rawHeader.sampleRate),
     byteRate: int(rawHeader.byteRate),
     bitsPerSample: int(rawHeader.bitsPerSample),
-    isFloat: (rawHeader.waveFormat == WAVE_FORMAT_IEEE_FLOAT.uint16)
+    isFloat: rawHeader.isFloat
   )
 
 proc readWavHeader*(stream: Stream): WavHeader {.raises: [IOError, OSError, WavParseError].} =
