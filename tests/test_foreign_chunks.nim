@@ -1,4 +1,4 @@
-import std/[streams, strutils, unittest]
+import std/[os, streams, strutils, unittest]
 import cozywavparser
 
 func le16(value: uint16): string =
@@ -83,6 +83,7 @@ suite "RIFF chunk handling":
       discard readWavHeader(stream)
       check false
     except WavParseError as e:
+      check e.kind == weNoFmt
       check e.msg.contains("found: 'JUNK', 'bext'")
 
   test "rejects fmt chunk smaller than 16 bytes":
@@ -91,6 +92,7 @@ suite "RIFF chunk handling":
       discard readWavHeader(stream)
       check false
     except WavParseError as e:
+      check e.kind == weInvalidFmtSize
       check e.msg.contains("Invalid fmt subchunk size: 12")
 
   test "rejects a truncated chunk header":
@@ -99,4 +101,31 @@ suite "RIFF chunk handling":
       discard readWavHeader(stream)
       check false
     except WavParseError as e:
+      check e.kind == weTruncatedHeader
       check e.msg.contains("Truncated RIFF chunk header")
+
+  test "reports unsupported wave format kind":
+    let stream = newStringStream(wavFile([("fmt ", le16(0xFFF0) & newString(14))]))
+    try:
+      discard readWavHeader(stream)
+      check false
+    except WavParseError as e:
+      check e.kind == weUnsupportedFormat
+      check e.msg.contains("65520")
+
+  test "WavParseError remains catchable as ValueError":
+    try:
+      discard readWavHeader(newStringStream(wavFile([("JUNK", newString(4))])))
+      check false
+    except ValueError as e:
+      check e of WavParseError
+
+  test "file wrapper preserves the parse error kind":
+    let path = getTempDir() / "cozywavparser-" & $getCurrentProcessId() & ".wav"
+    writeFile(path, wavFile([("JUNK", newString(4))]))
+    defer: removeFile(path)
+    try:
+      discard readWavFileHeader(path)
+      check false
+    except WavParseError as e:
+      check e.kind == weNoFmt

@@ -41,8 +41,20 @@ type
     bitsPerSample*: int
     isFloat*: bool
 
-  WavParseError* = object of CatchableError ##|
+  WavErrorKind* = enum ## Machine-readable reason a WAVE header was rejected.
+    weNoRiff
+    weNoWave
+    weNoFmt
+    weInvalidFmtSize
+    weUnsupportedFormat
+    weTruncatedHeader
+    weTruncatedChunk
+
+  WavParseError* = object of ValueError ##|
     ## Raised when a WAVE header is malformed or unsupported.
+    ##
+    ## `kind` identifies the failure without inspecting `msg`.
+    kind*: WavErrorKind
 
 {.push warning[HoleEnumConv]:off.}
 const
@@ -55,6 +67,22 @@ const
     wfSet
 {.pop.}
 
+func wavErrorMessage(kind: WavErrorKind; detail = ""): string =
+  case kind
+    of weNoRiff: "No RIFF header found"
+    of weNoWave: "No WAVE format marker found"
+    of weNoFmt:
+      if detail.len > 0: "No fmt subchunk found (found: " & detail & ")"
+      else: "No fmt subchunk found"
+    of weInvalidFmtSize: "Invalid fmt subchunk size: " & detail
+    of weUnsupportedFormat: "Unknown/unsupported wave format: " & detail
+    of weTruncatedHeader: "Truncated RIFF chunk header"
+    of weTruncatedChunk: "Unexpected end of file inside a RIFF chunk"
+
+proc newWavError(kind: WavErrorKind; detail = ""): ref WavParseError =
+  result = newException(WavParseError, wavErrorMessage(kind, detail))
+  result.kind = kind
+
 proc skipBytes(file: Stream; count: int64) {.raises: [IOError, OSError, WavParseError].} =
   ## Consumes `count` bytes from the stream without allocating `count` bytes.
   var
@@ -64,7 +92,7 @@ proc skipBytes(file: Stream; count: int64) {.raises: [IOError, OSError, WavParse
     let toRead = int(min(remaining, int64(buffer.len)))
     let readNow = file.readData(addr buffer[0], toRead)
     if readNow <= 0:
-      raise newException(WavParseError, "Unexpected end of file inside a RIFF chunk")
+      raise newWavError(weTruncatedChunk)
     remaining -= readNow
 
 proc skipChunkPayload(file: Stream; size: uint32) {.raises: [IOError, OSError, WavParseError].} =
@@ -83,7 +111,7 @@ proc readChunkHeader(file: Stream; chunk: var ChunkHeader): bool {.raises: [IOEr
   if bytesRead == 0:
     return false
   if bytesRead < chunk.id.len:
-    raise newException(WavParseError, "Truncated RIFF chunk header")
+    raise newWavError(weTruncatedHeader)
   chunk.size = readUint32(file)
   true
 
@@ -97,14 +125,14 @@ proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, W
   # Read RIFF header
   file.read(chunkID)
   if chunkID != CHUNKID:
-    raise newException(WavParseError, "No RIFF header found")
+    raise newWavError(weNoRiff)
 
   discard readUint32(file) # RIFF chunk size
 
   var format: array[4, char]
   file.read(format)
   if format != FORMAT:
-    raise newException(WavParseError, "No WAVE format marker found")
+    raise newWavError(weNoWave)
 
   # RIFF files may contain arbitrary chunks before the "fmt " chunk,
   # e.g. "bext", "JUNK" or "FLLR". Walk them until the format is found.
@@ -118,11 +146,11 @@ proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, W
   while readChunkHeader(file, chunk):
     if chunk.id == SUBCHUNK1ID:
       if chunk.size < 16:
-        raise newException(WavParseError, "Invalid fmt subchunk size: " & $chunk.size)
+        raise newWavError(weInvalidFmtSize, $chunk.size)
 
       result.waveFormat = readUint16(file)
       if result.waveFormat notin SupportedWaveFormatTags:
-        raise newException(WavParseError, "Unknown/unsupported wave format: " & $result.waveFormat)
+        raise newWavError(weUnsupportedFormat, $result.waveFormat)
 
       result.numChannels = readUint16(file)
       result.sampleRate = readUint32(file)
@@ -138,20 +166,18 @@ proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, W
     inc totalSeen
     skipChunkPayload(file, chunk.size)
 
-  var msg = "No fmt subchunk found"
+  var detail = ""
   if totalSeen > 0:
-    msg.add(" (found: ")
     for i in 0..<seenCount:
       if i > 0:
-        msg.add(", ")
-      msg.add('\'')
+        detail.add(", ")
+      detail.add('\'')
       for c in seenChunks[i]:
-        msg.add(c)
-      msg.add('\'')
+        detail.add(c)
+      detail.add('\'')
     if totalSeen > seenCount:
-      msg.add(", ...")
-    msg.add(')')
-  raise newException(WavParseError, msg)
+      detail.add(", ...")
+  raise newWavError(weNoFmt, detail)
 
 {.push warning[HoleEnumConv]:off.}
 proc toWaveFormatEnumUnsafe(n: uint16): WaveFormatTag {.inline.} = WaveFormatTag(n)
@@ -174,16 +200,15 @@ proc readWavHeader*(stream: Stream): WavHeader {.raises: [IOError, OSError, WavP
   ## is in an unknown/unsupported format.
   readWavHeaderRaw(stream).toWavHeader()
 
-proc readWavFileHeader*(path: string): WavHeader {.raises: [IOError, OSError, ValueError].} =
+proc readWavFileHeader*(path: string): WavHeader {.raises: [IOError, OSError, WavParseError].} =
   ## A helper wrapper around `readWavHeader`.
   ## Reads and parses a WAVE header from a WAV file.
   ##
-  ## A `ValueError` is raised when the header is malformed or the audio data
-  ## is in an unknown/unsupported format.
+  ## A `WavParseError` (a `ValueError`) is raised when the header is malformed
+  ## or the audio data is in an unknown/unsupported format.
   let stream = openFileStream(path, fmRead)
   try:
     result = readWavHeader(stream)
-  except WavParseError as e: raise newException(ValueError, e.msg)
   finally: stream.close()
 
 when isMainModule:
