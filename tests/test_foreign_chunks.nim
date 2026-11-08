@@ -235,3 +235,18 @@ suite "RIFF chunk handling":
       check false
     except WavParseError as e:
       check e.kind == weNoFmt
+
+  test "parses sanitized real-layout WAVs":
+    let cases = [
+      ("tests/wavs/bext-before-fmt-padded.wav", 1, 48000, 24, 144000),
+      ("tests/wavs/fllr-after-fmt.wav", 1, 44100, 16, 88200),
+      ("tests/wavs/canonical-pcm16.wav", 1, 48000, 16, 96000),
+    ]
+    for (path, channels, rate, bits, byteRate) in cases:
+      let header = readWavFileHeader(path)
+      check header.waveFormat == WAVE_FORMAT_PCM
+      check header.numChannels == channels
+      check header.sampleRate == rate
+      check header.bitsPerSample == bits
+      check header.byteRate == byteRate
+      check not header.isFloat
