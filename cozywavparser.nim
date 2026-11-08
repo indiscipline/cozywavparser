@@ -16,17 +16,15 @@ from std/enumutils import items
 
 type
   WavHeaderRaw = object
-    chunkID: array[4, char]
-    chunkSize: uint32
-    format: array[4, char]
-    subchunk1ID: array[4, char]
-    subchunk1Size: uint32
     waveFormat: uint16
     numChannels: uint16
     sampleRate: uint32
     byteRate: uint32
-    blockAlign: uint16
     bitsPerSample: uint16
+
+  ChunkHeader = object
+    id: array[4, char]
+    size: uint32
 
   WaveFormatTag* = enum ## Represents a non-exhaustive list of WAVE data formats.
     WAVE_FORMAT_PCM = (0x1, "PCM"),
@@ -36,16 +34,10 @@ type
     WAVE_FORMAT_EXTENSIBLE = (0xFFFE, "Extensible Wave Format"),
 
   WavHeader* = object ## A parsed and superficially validated WAVE header.
-    #chunkID: string
-    #chunkSize: int
-    #format: string
-    #subchunk1ID: string
-    #subchunk1Size: int
     waveFormat*: WaveFormatTag
     numChannels*: int
     sampleRate*: int
     byteRate*: int
-    #blockAlign: int
     bitsPerSample*: int
     isFloat*: bool
 
@@ -63,43 +55,103 @@ const
     wfSet
 {.pop.}
 
+proc skipBytes(file: Stream; count: int64) {.raises: [IOError, OSError, WavParseError].} =
+  ## Consumes `count` bytes from the stream without allocating `count` bytes.
+  var
+    remaining = count
+    buffer: array[4096, char]
+  while remaining > 0:
+    let toRead = int(min(remaining, int64(buffer.len)))
+    let readNow = file.readData(addr buffer[0], toRead)
+    if readNow <= 0:
+      raise newException(WavParseError, "Unexpected end of file inside a RIFF chunk")
+    remaining -= readNow
+
+proc skipChunkPayload(file: Stream; size: uint32) {.raises: [IOError, OSError, WavParseError].} =
+  ## Skips a chunk's data, including the pad byte required for odd sizes.
+  skipBytes(file, int64(size) + int64(size and 1))
+
+proc readChunkHeader(file: Stream; chunk: var ChunkHeader): bool {.raises: [IOError, OSError, WavParseError].} =
+  ## Reads the next RIFF chunk header into `chunk`.
+  ## Returns false at a clean end of stream, raises on a truncated header.
+  var bytesRead = 0
+  while bytesRead < chunk.id.len:
+    let readNow = file.readData(addr chunk.id[bytesRead], chunk.id.len - bytesRead)
+    if readNow <= 0:
+      break
+    bytesRead += readNow
+  if bytesRead == 0:
+    return false
+  if bytesRead < chunk.id.len:
+    raise newException(WavParseError, "Truncated RIFF chunk header")
+  chunk.size = readUint32(file)
+  true
+
 proc readWavHeaderRaw(file: Stream): WavHeaderRaw {.raises: [IOError, OSError, WavParseError].} =
   ## Reads a raw WAVE header from a stream.
   ##
   ## A `WavParseError` is raised when the header is malformed or the audio data
   ## is in an unknown/unsupported format.
-  var header: WavHeaderRaw
+  var chunkID: array[4, char]
 
   # Read RIFF header
-  file.read(header.chunkID)
-  if header.chunkID != CHUNKID:
+  file.read(chunkID)
+  if chunkID != CHUNKID:
     raise newException(WavParseError, "No RIFF header found")
 
-  header.chunkSize = readUint32(file)
+  discard readUint32(file) # RIFF chunk size
 
-  file.read(header.format)
-  if header.format != FORMAT:
+  var format: array[4, char]
+  file.read(format)
+  if format != FORMAT:
     raise newException(WavParseError, "No WAVE format marker found")
 
-  # Read "fmt " subchunk
-  file.read(header.subchunk1ID)
+  # RIFF files may contain arbitrary chunks before the "fmt " chunk,
+  # e.g. "bext", "JUNK" or "FLLR". Walk them until the format is found.
+  const MaxReportedChunks = 8
+  var
+    seenChunks: array[MaxReportedChunks, array[4, char]]
+    seenCount = 0
+    totalSeen = 0
+    chunk: ChunkHeader
 
-  if header.subchunk1ID != SUBCHUNK1ID:
-    raise newException(WavParseError, "No fmt subchunk found")
+  while readChunkHeader(file, chunk):
+    if chunk.id == SUBCHUNK1ID:
+      if chunk.size < 16:
+        raise newException(WavParseError, "Invalid fmt subchunk size: " & $chunk.size)
 
-  header.subchunk1Size = readUint32(file)
-  header.waveFormat = readUint16(file)
+      result.waveFormat = readUint16(file)
+      if result.waveFormat notin SupportedWaveFormatTags:
+        raise newException(WavParseError, "Unknown/unsupported wave format: " & $result.waveFormat)
 
-  if header.waveFormat notin SupportedWaveFormatTags:
-    raise newException(WavParseError, "Unknown/unsupported wave format: " & $header.waveFormat)
+      result.numChannels = readUint16(file)
+      result.sampleRate = readUint32(file)
+      result.byteRate = readUint32(file)
+      discard readUint16(file) # block align
+      result.bitsPerSample = readUint16(file)
+      skipChunkPayload(file, chunk.size - 16) # Extra fmt fields and padding
+      return result
 
-  header.numChannels = readUint16(file)
-  header.sampleRate = readUint32(file)
-  header.byteRate = readUint32(file)
-  header.blockAlign = readUint16(file)
-  header.bitsPerSample = readUint16(file)
+    if seenCount < MaxReportedChunks:
+      seenChunks[seenCount] = chunk.id
+      inc seenCount
+    inc totalSeen
+    skipChunkPayload(file, chunk.size)
 
-  header
+  var msg = "No fmt subchunk found"
+  if totalSeen > 0:
+    msg.add(" (found: ")
+    for i in 0..<seenCount:
+      if i > 0:
+        msg.add(", ")
+      msg.add('\'')
+      for c in seenChunks[i]:
+        msg.add(c)
+      msg.add('\'')
+    if totalSeen > seenCount:
+      msg.add(", ...")
+    msg.add(')')
+  raise newException(WavParseError, msg)
 
 {.push warning[HoleEnumConv]:off.}
 proc toWaveFormatEnumUnsafe(n: uint16): WaveFormatTag {.inline.} = WaveFormatTag(n)
@@ -107,16 +159,10 @@ proc toWaveFormatEnumUnsafe(n: uint16): WaveFormatTag {.inline.} = WaveFormatTag
 
 func toWavHeader(rawHeader: WavHeaderRaw): WavHeader {.inline.} =
   WavHeader(
-    #chunkID: $rawHeader.chunkID,
-    #chunkSize: int(rawHeader.chunkSize),
-    #format: $rawHeader.format,
-    #subchunk1ID: $rawHeader.subchunk1ID,
-    #subchunk1Size: int(rawHeader.subchunk1Size),
     waveFormat: toWaveFormatEnumUnsafe(rawHeader.waveFormat),
     numChannels: int(rawHeader.numChannels),
     sampleRate: int(rawHeader.sampleRate),
     byteRate: int(rawHeader.byteRate),
-    #blockAlign: int(rawHeader.blockAlign),
     bitsPerSample: int(rawHeader.bitsPerSample),
     isFloat: (rawHeader.waveFormat == WAVE_FORMAT_IEEE_FLOAT.uint16)
   )

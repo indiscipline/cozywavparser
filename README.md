@@ -9,6 +9,7 @@ While the actual PCM format specification is complex, this module focuses on sup
 ## Features
 
 - Supports parsing headers for the most common WAVE files
+- Skips unknown RIFF chunks (e.g. `bext`, `JUNK`, `PAD `, `FLLR`) that precede the `fmt ` chunk
 - Extracts essential audio stream information: sample rate, bit depth, number of channels, byte rate, and float/integer sample format
 
 > [!WARNING]
@@ -55,6 +56,14 @@ stream.close()
 ## Documentation
 
 Documentation is included. You can generate it locally with `nim doc cozywavparser.nim`.
+
+## Testing
+
+The RIFF chunk-walking regression suite synthesizes WAV files in memory; it does not require any audio fixtures:
+
+```
+nim c -r --path:. tests/test_foreign_chunks.nim
+```
 
 ## License
 
